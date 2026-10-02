@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="zh-CN">
 <meta charset="utf-8">
-<title>电台排程</title>
+<title>电台排程 · 广告名额账</title>
 <style>
 body{font:15px system-ui;max-width:1100px;margin:24px auto;padding:0 16px;background:#f7f7f5;color:#222}
 section{background:white;padding:16px;margin:12px 0;border:1px solid #ddd;border-radius:10px}
@@ -21,6 +21,21 @@ button{cursor:pointer;background:#16324f;color:white}pre{white-space:pre-wrap;ma
 <input id="sid" type="number" placeholder="排期 ID"><input id="newpid" type="number" placeholder="替换节目 ID"><input id="actualstart" value="12:00">
 <input id="actualduration" type="number" value="30" placeholder="实播分钟"><input id="actualpid" type="number" placeholder="实播节目 ID，可空"></div>
 <button onclick="schedule()">排期</button><button onclick="replace()">替换</button><button onclick="playout()">记录实播</button><button onclick="reconcile()">对账</button><pre id="result"></pre></section>
+<section><h2>广告名额账看板（占用 / 剩余时段）</h2>
+<div class="grid"><input id="adate" value="2026-09-28"><input id="aregion" value="华东"><button onclick="adBoard()">查看看板</button></div>
+<div id="board"></div><pre id="adresult"></pre></section>
+<section><h2>广告合同（合同号=幂等键，写入失败凭合同号重提恢复）</h2>
+<div class="grid"><input id="cno" value="HT-2026-0002"><input id="cadv" placeholder="广告主"><input id="citem" value='[{"region":"华东","air_date":"2026-09-28","version":"A版","bought":2}]'></div>
+<button onclick="adContract()">创建/恢复合同</button></section>
+<section><h2>广告排期（先到先得，冲突返回 409）/ 改版 / 撤档</h2>
+<div class="grid"><input id="sno" value="HT-2026-0002" placeholder="合同号"><input id="sregion" value="华东"><input id="sdate" value="2026-09-28">
+<input id="sver" value="A版" placeholder="节目版本"><input id="sstart" value="11:30"><input id="sdur" type="number" value="5">
+<input id="sop" placeholder="排期员"><input id="ssid" type="number" placeholder="排期 ID"><input id="snewver" placeholder="新版本"></div>
+<button onclick="adBook()">提交排期</button><button onclick="adRevise()">改版重算</button><button onclick="adCancel()">撤档</button></section>
+<section><h2>播出回执（同一回执只核销一次；超投/重复补量播后落异常）</h2>
+<div class="grid"><input id="rno" placeholder="回执号"><input id="rcno" value="HT-2026-0002"><input id="rregion" value="华东">
+<input id="rdate" value="2026-09-28"><input id="rver" value="A版"><input id="rsid" type="number" placeholder="排期ID，可空"></div>
+<button onclick="adReceipt()">提交回执</button></section>
 <script>
 const api=async(url,body)=>{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();out(j);return j};
 const out=x=>document.querySelector('#result').textContent=JSON.stringify(x,null,2);
@@ -30,6 +45,38 @@ function schedule(){api('/api/schedule',{air_date:airdate.value,start_time:start
 function replace(){api('/api/slots/'+sid.value+'/replace',{new_program_id:+newpid.value})}
 function playout(){api('/api/playout',{slot_id:+sid.value,actual_start:actualstart.value,actual_duration_minutes:+actualduration.value,actual_program_id:actualpid.value?+actualpid.value:null})}
 function reconcile(){api('/api/reconcile',{date:airdate.value})}
-load();
+const adout=x=>document.querySelector('#adresult').textContent=JSON.stringify(x,null,2);
+async function adApi(url,body){
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json(); adout(j);
+  if(r.status===409&&j.conflict){adBoard(j.conflict.day.air_date,j.conflict.day.region)}
+  return j;
+}
+function adContract(){
+  let items; try{items=JSON.parse(citem.value)}catch(e){adout({error:'合同明细必须是 JSON 数组'});return}
+  adApi('/api/ads/contracts',{contract_no:cno.value,advertiser:cadv.value,items});
+}
+function adBook(){adApi('/api/ads/slots',{contract_no:sno.value,region:sregion.value,air_date:sdate.value,
+  version:sver.value,start_time:sstart.value,duration_minutes:+sdur.value,operator:sop.value}).then(j=>{if(j.ok)adBoard()})}
+function adRevise(){adApi('/api/ads/slots/'+ssid.value+'/revise',{new_version:snewver.value}).then(j=>{if(j.ok)adBoard()})}
+function adCancel(){adApi('/api/ads/slots/'+ssid.value+'/cancel',{}).then(j=>{if(j.ok)adBoard()})}
+function adReceipt(){adApi('/api/ads/receipts',{receipt_no:rno.value,contract_no:rcno.value,region:rregion.value,
+  air_date:rdate.value,version:rver.value,slot_id:rsid.value?+rsid.value:null}).then(j=>{if(j.ok)adBoard()})}
+async function adBoard(date,region){
+  const d=date||adate.value, g=region||aregion.value;
+  const j=await (await fetch('/api/ads/board?date='+d+'&region='+encodeURIComponent(g))).json();
+  adout(j);
+  if(j.error)return;
+  const acc=j.accounts.map(a=>`<tr><td>${a.contract_no}</td><td>${a.advertiser}</td><td>${a.version}</td>
+    <td>${a.bought}</td><td>${a.reserved}</td><td>${a.verified}</td><td><b>${a.remaining}</b></td></tr>`).join('');
+  const days=j.days.map(day=>`<h3>${day.region}</h3>
+    <p>占用：${day.occupied.map(o=>`#${o.slot_id} ${o.start}-${o.end} ${o.advertiser}/${o.version}(${o.status})`).join('；')||'无'}</p>
+    <p>剩余时段：${day.free.join('，')||'全天占满'}</p>`).join('');
+  const exc=j.exceptions.map(e=>`<li>${e.kind}：${e.detail}</li>`).join('');
+  document.querySelector('#board').innerHTML=
+    `<table border=1 cellpadding=4><tr><th>合同</th><th>广告主</th><th>版本</th><th>购买</th><th>占用</th><th>已核销</th><th>剩余</th></tr>${acc}</table>
+     ${days}${exc?`<p>播后异常：<ul>${exc}</ul></p>`:''}`;
+}
+load();adBoard();
 </script>
 </html>

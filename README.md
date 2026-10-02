@@ -35,3 +35,23 @@ python -m unittest discover -s tests -v
 - `POST /api/reconcile`：按日期生成漏播、错播、时长偏差和超授权异常
 
 准备排期时填写 `air_date`、`start_time`、`program_id`、`region`。页面会直接显示校验错误，不会保存失败的排期。
+
+## 广告名额账
+
+广告合同、节目排期、播出回执共用一份名额账，扣次维度为 **(合同号, 地区, 日期, 节目版本)**：
+
+- 各地联播各算各的名额；排期占用未播名额（`reserved`），回执核销后转为 `verified`，账面约束 `reserved + verified <= bought`。
+- 节目改版（`revise`）/撤档（`cancel`）只重算未播部分；已播核销永久留在旧版本，不可改撤。
+- 回执号是幂等键：同一回执只核销一次，写入失败后凭合同号/回执号重提不会重复扣次；超投和重复补量不在排期阶段拦截，而是在回执提交后写入 `ad_settlement_exceptions`。
+- 所有写操作走 `BEGIN IMMEDIATE` 事务，两名排期员并发时先到先得；后到者收到 `409`，响应体携带剩余名额、占用/剩余时段和冲突节目。
+
+广告相关 API：
+
+- `POST /api/ads/contracts`：按明细建账；合同号为幂等键，重提返回 `recovered:true`，明细不一致则拒绝
+- `GET  /api/ads/contracts/{no}`：凭合同号查看/恢复一份账
+- `POST /api/ads/slots`：排期扣次，售罄或时段重叠返回 409 及冲突看板
+- `POST /api/ads/slots/{id}/revise`：改版，直接重算未播名额
+- `POST /api/ads/slots/{id}/cancel`：撤档，释放未播名额
+- `POST /api/ads/receipts`：播出回执核销（可带 `slot_id`，也可登记无排期实播）
+- `GET  /api/ads/board?date=&region=`：名额余量、占用与剩余时段、播后异常
+
