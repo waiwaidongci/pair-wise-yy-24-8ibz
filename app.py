@@ -52,6 +52,18 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/state":
                 return self._json(200, self.db.snapshot())
+            if parsed.path == "/api/contracts":
+                q = parse_qs(parsed.query)
+                return self._json(200, {"contracts": self.db.list_contracts(
+                    q.get("region", [""])[0] or None, q.get("date", [""])[0] or None,
+                    q.get("advertiser", [""])[0] or None)})
+            if parsed.path == "/api/availability":
+                q = parse_qs(parsed.query)
+                date = q.get("date", [""])[0]
+                region = q.get("region", [""])[0]
+                if not date or not region:
+                    raise DomainError("缺少 date 或 region 参数")
+                return self._json(200, self.db.get_availability(date, region))
             if parsed.path == "/api/reconciliation":
                 date = parse_qs(parsed.query).get("date", [""])[0]
                 if not date:
@@ -86,12 +98,24 @@ class Handler(BaseHTTPRequestHandler):
                     int(body.get("actual_duration_minutes", 0)),
                     int(body["actual_program_id"]) if body.get("actual_program_id") else None,
                     str(body.get("note", "")),
+                    str(body.get("receipt_no", "")) or None,
                 )
                 return self._json(201, {"ok": True, "id": log_id})
+            if parsed.path == "/api/contracts":
+                contract_id = self.db.add_contract(
+                    str(body.get("advertiser", "")), str(body.get("region", "")),
+                    str(body.get("air_date", "")), int(body.get("program_id", 0)),
+                    int(body.get("total_count", 0)), str(body.get("note", "")),
+                )
+                return self._json(201, {"ok": True, "id": contract_id, "contract": self.db.get_contract(contract_id)})
+            if len(parts) == 4 and parts[:2] == ["api", "contracts"] and parts[3] == "recover":
+                return self._json(200, {"ok": True, "contract": self.db.recover_contract(int(parts[2]))})
             if parsed.path == "/api/reconcile":
                 return self._json(200, {"ok": True, "exceptions": self.db.reconcile_date(str(body.get("date", "")))})
             if len(parts) == 4 and parts[:2] == ["api", "slots"] and parts[3] == "replace":
                 return self._json(200, {"ok": True, "slot": self.db.replace_slot(int(parts[2]), int(body.get("new_program_id", 0)))})
+            if len(parts) == 4 and parts[:2] == ["api", "slots"] and parts[3] == "cancel":
+                return self._json(200, {"ok": True, "slot": self.db.cancel_slot(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "programs"] and parts[3] == "regions":
                 self.db.authorize_region(int(parts[2]), str(body.get("region", "")))
                 return self._json(201, {"ok": True})

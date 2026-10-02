@@ -16,6 +16,8 @@ WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6
 
 
 def _minutes(value: str) -> int:
+    if value == "24:00":
+        return 24 * 60
     parsed = datetime.strptime(value, "%H:%M")
     return parsed.hour * 60 + parsed.minute
 
@@ -40,6 +42,10 @@ class RadioDB:
         self.conn.execute("PRAGMA foreign_keys = ON")
         if path != ":memory:":
             self.conn.execute("PRAGMA journal_mode = WAL")
+        # Let concurrent BEGIN IMMEDIATE calls wait for each other instead of
+        # failing with SQLITE_BUSY, so two schedulers submitting at the same
+        # time are serialized first-come-first-served.
+        self.conn.execute("PRAGMA busy_timeout = 10000")
         self._schema()
 
     def close(self) -> None:
@@ -119,9 +125,37 @@ class RadioDB:
               created_at TEXT NOT NULL,
               UNIQUE(air_date, slot_id, kind)
             );
+            CREATE TABLE IF NOT EXISTS contracts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              advertiser TEXT NOT NULL,
+              region TEXT NOT NULL,
+              air_date TEXT NOT NULL,
+              program_id INTEGER NOT NULL REFERENCES programs(id),
+              total_count INTEGER NOT NULL CHECK(total_count > 0),
+              note TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              UNIQUE(advertiser, region, air_date, program_id)
+            );
+            CREATE TABLE IF NOT EXISTS quota_movements (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              contract_id INTEGER NOT NULL REFERENCES contracts(id) ON DELETE CASCADE,
+              delta INTEGER NOT NULL,
+              kind TEXT NOT NULL CHECK(kind IN ('grant','occupy','release','writeoff')),
+              ref_type TEXT NOT NULL,
+              ref_id INTEGER NOT NULL,
+              idem_key TEXT NOT NULL UNIQUE,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_quota_movements_contract ON quota_movements(contract_id);
+            CREATE INDEX IF NOT EXISTS idx_quota_movements_slot ON quota_movements(ref_type, ref_id);
             """
         )
         self.conn.commit()
+        # Lightweight migration: older databases lack the receipt_no column on playout_logs.
+        cols = [row[1] for row in self.conn.execute("PRAGMA table_info(playout_logs)").fetchall()]
+        if "receipt_no" not in cols:
+            self.conn.execute("ALTER TABLE playout_logs ADD COLUMN receipt_no TEXT")
+            self.conn.commit()
 
     def seed_demo(self) -> None:
         existing = self.conn.execute("SELECT COUNT(*) FROM programs").fetchone()[0]
@@ -191,6 +225,274 @@ class RadioDB:
                 (region.strip(), weekday, start_time, end_time, reason.strip() or "禁播"),
             )
         return int(cur.lastrowid)
+
+    # ------------------------------------------------------------------
+    # 广告合同与名额账
+    # ------------------------------------------------------------------
+    def add_contract(self, advertiser: str, region: str, air_date: str, program_id: int,
+                     total_count: int, note: str = "") -> int:
+        advertiser = advertiser.strip()
+        region = region.strip()
+        if not advertiser:
+            raise DomainError("广告主不能为空")
+        if not region:
+            raise DomainError("地区不能为空")
+        if total_count <= 0:
+            raise DomainError("购买次数必须大于0")
+        try:
+            datetime.strptime(air_date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise DomainError("日期必须使用 YYYY-MM-DD") from exc
+        if not self.conn.execute("SELECT 1 FROM programs WHERE id=?", (program_id,)).fetchone():
+            raise DomainError("节目版本不存在")
+        with self.transaction():
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO contracts(advertiser,region,air_date,program_id,total_count,note,created_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (advertiser, region, air_date, program_id, total_count, note, datetime.now().isoformat()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("已存在相同广告主/地区/日期/节目版本的合同") from exc
+            contract_id = int(cur.lastrowid)
+            self.conn.execute(
+                "INSERT INTO quota_movements(contract_id,delta,kind,ref_type,ref_id,idem_key,created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (contract_id, total_count, "grant", "contract", contract_id,
+                 f"contract:{contract_id}:grant", datetime.now().isoformat()),
+            )
+        return contract_id
+
+    def _contract_for(self, advertiser: str, region: str, air_date: str, program_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM contracts WHERE advertiser=? AND region=? AND air_date=? AND program_id=? ORDER BY id LIMIT 1",
+            (advertiser, region, air_date, program_id),
+        ).fetchone()
+
+    def _contract_summary(self, contract_id: int) -> dict:
+        row = self.conn.execute("SELECT * FROM contracts WHERE id=?", (contract_id,)).fetchone()
+        if not row:
+            raise DomainError("合同不存在")
+        agg = self.conn.execute(
+            "SELECT "
+            "COALESCE(SUM(delta) FILTER (WHERE kind='occupy'),0) AS occ, "
+            "COALESCE(SUM(delta) FILTER (WHERE kind='release'),0) AS rel, "
+            "COALESCE(SUM(delta) FILTER (WHERE kind='writeoff'),0) AS woff "
+            "FROM quota_movements WHERE contract_id=?",
+            (contract_id,),
+        ).fetchone()
+        d = dict(row)
+        d["occupied"] = -(int(agg["occ"]) + int(agg["rel"]))
+        d["released"] = int(agg["rel"])
+        d["written_off"] = -int(agg["woff"])
+        d["remaining"] = int(row["total_count"]) + int(agg["occ"]) + int(agg["rel"]) + int(agg["woff"])
+        return d
+
+    def get_contract(self, contract_id: int) -> dict:
+        return self._contract_summary(contract_id)
+
+    def list_contracts(self, region: str | None = None, air_date: str | None = None,
+                        advertiser: str | None = None) -> list[dict]:
+        sql = "SELECT id FROM contracts WHERE 1=1"
+        params: list[object] = []
+        if region:
+            sql += " AND region=?"
+            params.append(region)
+        if air_date:
+            sql += " AND air_date=?"
+            params.append(air_date)
+        if advertiser:
+            sql += " AND advertiser=?"
+            params.append(advertiser)
+        sql += " ORDER BY id"
+        return [self._contract_summary(int(r["id"])) for r in self.conn.execute(sql, params).fetchall()]
+
+    def _slot_row(self, slot_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT s.*, p.sponsor FROM slots s JOIN programs p ON p.id=s.program_id WHERE s.id=?",
+            (slot_id,),
+        ).fetchone()
+
+    def _occupy_for_slot(self, slot_id: int) -> int | None:
+        """Hold one quota against the contract matching the slot's current version.
+
+        Raises DomainError with the remaining quota and the conflicting programs
+        when the contract has no quota left, so the later scheduler sees both.
+        """
+        slot = self._slot_row(slot_id)
+        if not slot:
+            raise DomainError("排期不存在")
+        sponsor = slot["sponsor"]
+        if not sponsor:
+            return None
+        contract = self._contract_for(sponsor, slot["region"], slot["air_date"], slot["program_id"])
+        if not contract:
+            return None
+        summary = self._contract_summary(int(contract["id"]))
+        if summary["remaining"] < 1:
+            conflicts = [dict(r) for r in self.conn.execute(
+                "SELECT s.id, s.start_time, s.duration_minutes, s.status, p.title "
+                "FROM slots s JOIN programs p ON p.id=s.program_id "
+                "WHERE s.region=? AND s.air_date=? AND s.program_id=? AND s.status!='cancelled' AND s.id!=? "
+                "ORDER BY s.start_time",
+                (slot["region"], slot["air_date"], slot["program_id"], slot_id),
+            ).fetchall()]
+            conflict_text = "；".join(
+                f"#{c['id']} {c['title']} {c['start_time']}({c['status']})" for c in conflicts
+            ) or "无"
+            raise DomainError(
+                f"合同 {contract['id']}（{sponsor} {slot['region']} {slot['air_date']} 版本#{slot['program_id']}）"
+                f"剩余名额 {summary['remaining']} 次，无法占用；冲突节目: {conflict_text}"
+            )
+        self.conn.execute(
+            "INSERT OR IGNORE INTO quota_movements(contract_id,delta,kind,ref_type,ref_id,idem_key,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (int(contract["id"]), -1, "occupy", "slot", slot_id,
+             f"slot:{slot_id}:occupy", datetime.now().isoformat()),
+        )
+        return int(contract["id"])
+
+    def _release_for_slot(self, slot_id: int) -> None:
+        occ = self.conn.execute(
+            "SELECT contract_id FROM quota_movements WHERE ref_type='slot' AND ref_id=? AND kind='occupy'",
+            (slot_id,),
+        ).fetchone()
+        if not occ:
+            return
+        self.conn.execute(
+            "INSERT OR IGNORE INTO quota_movements(contract_id,delta,kind,ref_type,ref_id,idem_key,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (int(occ["contract_id"]), +1, "release", "slot", slot_id,
+             f"slot:{slot_id}:release", datetime.now().isoformat()),
+        )
+
+    def _writeoff_for_slot(self, slot_id: int, playout_id: int, receipt_no: str | None = None) -> None:
+        """Release the slot's hold and record the write-off, idempotently."""
+        slot = self._slot_row(slot_id)
+        if not slot:
+            return
+        occ = self.conn.execute(
+            "SELECT contract_id FROM quota_movements WHERE ref_type='slot' AND ref_id=? AND kind='occupy'",
+            (slot_id,),
+        ).fetchone()
+        contract_id = int(occ["contract_id"]) if occ else None
+        if occ:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO quota_movements(contract_id,delta,kind,ref_type,ref_id,idem_key,created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (contract_id, +1, "release", "slot", slot_id,
+                 f"slot:{slot_id}:release", datetime.now().isoformat()),
+            )
+        elif slot["sponsor"]:
+            contract = self._contract_for(slot["sponsor"], slot["region"], slot["air_date"], slot["program_id"])
+            if contract:
+                contract_id = int(contract["id"])
+        if contract_id is None:
+            return
+        idem = f"receipt:{receipt_no}" if (receipt_no or "").strip() else f"playout:{playout_id}"
+        self.conn.execute(
+            "INSERT OR IGNORE INTO quota_movements(contract_id,delta,kind,ref_type,ref_id,idem_key,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (contract_id, -1, "writeoff", "playout", playout_id, idem, datetime.now().isoformat()),
+        )
+
+    def recover_contract(self, contract_id: int) -> dict:
+        """Rebuild the ledger for a contract from current slots and playouts.
+
+        Used after a failed write to restore the account by contract number:
+        every non-grant movement is dropped and recomputed from scratch.
+        """
+        contract = self.conn.execute("SELECT * FROM contracts WHERE id=?", (contract_id,)).fetchone()
+        if not contract:
+            raise DomainError("合同不存在")
+        with self.transaction():
+            self.conn.execute("DELETE FROM quota_movements WHERE contract_id=? AND kind!='grant'", (contract_id,))
+            slots = self.conn.execute(
+                "SELECT s.*, p.sponsor FROM slots s JOIN programs p ON p.id=s.program_id "
+                "WHERE s.region=? AND s.air_date=? AND s.program_id=? AND s.status!='cancelled' "
+                "ORDER BY s.start_time",
+                (contract["region"], contract["air_date"], contract["program_id"]),
+            ).fetchall()
+            for slot in slots:
+                if slot["sponsor"] != contract["advertiser"]:
+                    continue
+                playouts = self.conn.execute(
+                    "SELECT id, receipt_no FROM playout_logs WHERE slot_id=? ORDER BY id", (slot["id"],)
+                ).fetchall()
+                if playouts:
+                    # Reconstruct the full lifecycle: the hold was placed at
+                    # schedule time and released on the first receipt; every
+                    # receipt is one consumption.
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO quota_movements(contract_id,delta,kind,ref_type,ref_id,idem_key,created_at) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (contract_id, -1, "occupy", "slot", slot["id"],
+                         f"slot:{slot['id']}:occupy", datetime.now().isoformat()),
+                    )
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO quota_movements(contract_id,delta,kind,ref_type,ref_id,idem_key,created_at) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (contract_id, +1, "release", "slot", slot["id"],
+                         f"slot:{slot['id']}:release", datetime.now().isoformat()),
+                    )
+                    for pl in playouts:
+                        idem = f"receipt:{pl['receipt_no']}" if pl["receipt_no"] else f"playout:{pl['id']}"
+                        self.conn.execute(
+                            "INSERT OR IGNORE INTO quota_movements(contract_id,delta,kind,ref_type,ref_id,idem_key,created_at) "
+                            "VALUES(?,?,?,?,?,?,?)",
+                            (contract_id, -1, "writeoff", "playout", pl["id"], idem, datetime.now().isoformat()),
+                        )
+                else:
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO quota_movements(contract_id,delta,kind,ref_type,ref_id,idem_key,created_at) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (contract_id, -1, "occupy", "slot", slot["id"],
+                         f"slot:{slot['id']}:occupy", datetime.now().isoformat()),
+                    )
+        return self._contract_summary(contract_id)
+
+    def get_availability(self, air_date: str, region: str,
+                         day_start: str = "06:00", day_end: str = "24:00") -> dict:
+        """Occupied slots and remaining free time ranges for a day/region."""
+        try:
+            datetime.strptime(air_date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise DomainError("日期必须使用 YYYY-MM-DD") from exc
+        self.conn.execute("SELECT 1 FROM program_regions WHERE region=? LIMIT 1", (region,)).fetchone()
+        occupied: list[dict] = []
+        intervals: list[tuple[int, int]] = []
+        for row in self.conn.execute(
+            "SELECT s.*, p.title FROM slots s JOIN programs p ON p.id=s.program_id "
+            "WHERE s.air_date=? AND s.region=? AND s.status!='cancelled' ORDER BY s.start_time",
+            (air_date, region),
+        ).fetchall():
+            start = _minutes(row["start_time"])
+            end = start + int(row["duration_minutes"])
+            occupied.append({
+                "id": row["id"], "title": row["title"], "program_id": row["program_id"],
+                "start_time": row["start_time"], "end_time": f"{end // 60:02d}:{end % 60:02d}",
+                "status": row["status"],
+            })
+            intervals.append((start, end))
+        intervals.sort()
+        merged: list[tuple[int, int]] = []
+        for start, end in intervals:
+            if merged and start < merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        free: list[dict] = []
+        cursor = _minutes(day_start)
+        close = _minutes(day_end)
+        for start, end in merged:
+            if start > cursor:
+                free.append({"start_time": f"{cursor // 60:02d}:{cursor % 60:02d}",
+                             "end_time": f"{min(start, close) // 60:02d}:{min(start, close) % 60:02d}"})
+            cursor = max(cursor, end)
+        if cursor < close:
+            free.append({"start_time": f"{cursor // 60:02d}:{cursor % 60:02d}",
+                         "end_time": f"{close // 60:02d}:{close % 60:02d}"})
+        return {"date": air_date, "region": region, "occupied": occupied, "free": free}
 
     def _validate_slot(self, air_date: str, start_time: str, duration: int, program_id: int,
                        region: str, ignore_slot_id: int | None = None) -> None:
@@ -267,10 +569,19 @@ class RadioDB:
                 "INSERT INTO slots(air_date,start_time,duration_minutes,program_id,region,created_at) VALUES(?,?,?,?,?,?)",
                 (air_date, start_time, int(program["duration_minutes"]), program_id, region, datetime.now().isoformat()),
             )
-        return int(cur.lastrowid)
+            slot_id = int(cur.lastrowid)
+            # Occupy the contract quota last: a quota failure rolls the whole
+            # schedule back, so a rejected slot is never saved.
+            self._occupy_for_slot(slot_id)
+        return slot_id
 
     def replace_slot(self, slot_id: int, new_program_id: int) -> dict:
-        """Replace a planned item and revalidate the resulting plan atomically."""
+        """Replace a planned item and revalidate the resulting plan atomically.
+
+        The unbroadcast quota is recomputed: the old version's hold is released
+        and the new version's contract is occupied instead. A version change on
+        an already-aired slot leaves its write-off untouched.
+        """
         with self.transaction():
             slot = self.conn.execute("SELECT * FROM slots WHERE id=? AND status='planned'", (slot_id,)).fetchone()
             if not slot:
@@ -279,10 +590,15 @@ class RadioDB:
             if not program:
                 raise DomainError("替换节目不存在")
             self._validate_slot(slot["air_date"], slot["start_time"], int(program["duration_minutes"]), new_program_id, slot["region"], slot_id)
+            already_aired = self.conn.execute("SELECT 1 FROM playout_logs WHERE slot_id=? LIMIT 1", (slot_id,)).fetchone() is not None
+            if not already_aired:
+                self._release_for_slot(slot_id)
             self.conn.execute(
                 "UPDATE slots SET program_id=?, duration_minutes=?, replaced_from=?, status='replaced' WHERE id=?",
                 (new_program_id, int(program["duration_minutes"]), slot["program_id"], slot_id),
             )
+            if not already_aired:
+                self._occupy_for_slot(slot_id)
         return self.get_slot(slot_id)
 
     def get_slot(self, slot_id: int) -> dict:
@@ -294,8 +610,21 @@ class RadioDB:
             raise DomainError("排期不存在")
         return dict(row)
 
+    def cancel_slot(self, slot_id: int) -> dict:
+        """Pull a slot from the schedule; its unbroadcast hold is released."""
+        with self.transaction():
+            slot = self.conn.execute(
+                "SELECT * FROM slots WHERE id=? AND status!='cancelled'", (slot_id,)
+            ).fetchone()
+            if not slot:
+                raise DomainError("排期不存在或已撤档")
+            self._release_for_slot(slot_id)
+            self.conn.execute("UPDATE slots SET status='cancelled' WHERE id=?", (slot_id,))
+        return self.get_slot(slot_id)
+
     def record_playout(self, slot_id: int, actual_start: str, actual_duration_minutes: int,
-                       actual_program_id: int | None = None, note: str = "") -> int:
+                       actual_program_id: int | None = None, note: str = "",
+                       receipt_no: str | None = None) -> int:
         if not self.conn.execute("SELECT 1 FROM slots WHERE id=?", (slot_id,)).fetchone():
             raise DomainError("排期不存在")
         if actual_duration_minutes < 0:
@@ -303,10 +632,16 @@ class RadioDB:
         _minutes(actual_start)
         with self.transaction():
             cur = self.conn.execute(
-                "INSERT INTO playout_logs(slot_id,actual_start,actual_duration_minutes,actual_program_id,note,created_at) VALUES(?,?,?,?,?,?)",
-                (slot_id, actual_start, actual_duration_minutes, actual_program_id, note, datetime.now().isoformat()),
+                "INSERT INTO playout_logs(slot_id,actual_start,actual_duration_minutes,actual_program_id,note,receipt_no,created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (slot_id, actual_start, actual_duration_minutes, actual_program_id, note,
+                 (receipt_no or "").strip() or None, datetime.now().isoformat()),
             )
-        return int(cur.lastrowid)
+            playout_id = int(cur.lastrowid)
+            # Idempotent write-off: the same receipt (receipt_no) never consumes
+            # quota twice. A hold is released first, then the write-off recorded.
+            self._writeoff_for_slot(slot_id, playout_id, receipt_no)
+        return playout_id
 
     def reconcile_date(self, air_date: str) -> list[dict]:
         """Compare the latest playout per slot with the plan and persist exceptions."""
@@ -361,6 +696,8 @@ class RadioDB:
         slots = [dict(row) for row in self.conn.execute(
             "SELECT s.*, p.title, p.kind FROM slots s JOIN programs p ON p.id=s.program_id ORDER BY s.air_date,s.start_time"
         ).fetchall()]
-        return {"programs": programs, "slots": slots, "exceptions": [dict(row) for row in self.conn.execute(
-            "SELECT * FROM reconciliation_exceptions ORDER BY id DESC LIMIT 50"
-        ).fetchall()]}
+        return {"programs": programs, "slots": slots,
+                "contracts": self.list_contracts(),
+                "exceptions": [dict(row) for row in self.conn.execute(
+                    "SELECT * FROM reconciliation_exceptions ORDER BY id DESC LIMIT 50"
+                ).fetchall()]}

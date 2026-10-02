@@ -1,35 +1,127 @@
 <!doctype html>
 <html lang="zh-CN">
 <meta charset="utf-8">
-<title>电台排程</title>
+<title>电台排程 · 名额账</title>
 <style>
-body{font:15px system-ui;max-width:1100px;margin:24px auto;padding:0 16px;background:#f7f7f5;color:#222}
+body{font:15px system-ui;max-width:1180px;margin:24px auto;padding:0 16px;background:#f7f7f5;color:#222}
 section{background:white;padding:16px;margin:12px 0;border:1px solid #ddd;border-radius:10px}
 input,select,button{padding:7px;margin:3px;border:1px solid #bbb;border-radius:6px}
-button{cursor:pointer;background:#16324f;color:white}pre{white-space:pre-wrap;max-height:360px;overflow:auto}
+button{cursor:pointer;background:#16324f;color:white}button.alt{background:#5a6b7b}button.danger{background:#a83a3a}
+pre{white-space:pre-wrap;max-height:360px;overflow:auto}
 .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.grid input{width:90%}
+table{border-collapse:collapse;width:100%;margin-top:8px}
+th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;font-size:14px}
+th{background:#eef2f5}
+.bad{color:#a83a3a;font-weight:600}.ok{color:#2a7a3a;font-weight:600}
+.bar{height:14px;border-radius:7px;background:#e3e8ec;overflow:hidden;display:inline-block;width:160px;vertical-align:middle}
+.bar>i{display:block;height:100%;background:#4a7ba6}
+.timeline{position:relative;height:34px;background:#eef2f5;border-radius:6px;margin:8px 0;overflow:hidden}
+.timeline .occ{position:absolute;height:100%;background:#4a7ba6;color:#fff;font-size:12px;padding:0 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.timeline .free{position:absolute;height:100%;background:#dfe7dd;color:#4a5a4a;font-size:12px;padding:0 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 </style>
-<h1>电台播出与版权窗口排程</h1>
+<h1>电台排程 · 合同名额账</h1>
 <section><h2>当前计划</h2><button onclick="load()">刷新</button><pre id="state"></pre></section>
+
+<section><h2>广告合同（按地区 / 日期 / 节目版本扣次）</h2>
+<div class="grid">
+<input id="cadv" placeholder="广告主" value="青柠饮品"><input id="cregion" placeholder="地区" value="华东"><input id="cdate" value="2026-09-28">
+<input id="cpid" type="number" placeholder="节目版本 ID"><input id="ccount" type="number" value="3" placeholder="购买次数"><input id="cnote" placeholder="备注，可空">
+</div>
+<button onclick="addContract()">创建合同并授予名额</button>
+<div style="margin-top:10px">
+地区 <input id="fregion" value="华东" style="width:80px"> 日期 <input id="fdate" value="2026-09-28" style="width:120px">
+<button class="alt" onclick="loadContracts()">查询合同</button>
+</div>
+<table id="ctable"><thead><tr><th>合同号</th><th>广告主</th><th>地区</th><th>日期</th><th>版本</th><th>购买</th><th>已占用</th><th>已核销</th><th>剩余</th><th>占用</th><th>操作</th></tr></thead><tbody></tbody></table>
+</section>
+
+<section><h2>占用与剩余时段</h2>
+<div class="grid">
+<input id="aregion" value="华东" placeholder="地区"><input id="adate" value="2026-09-28" placeholder="日期"><button onclick="loadAvailability()">查看时段</button>
+</div>
+<div id="atimeline" class="timeline"></div>
+<h3>已占用</h3><table id="aocc"><thead><tr><th>排期</th><th>节目</th><th>开始</th><th>结束</th><th>状态</th></tr></thead><tbody></tbody></table>
+<h3>剩余时段</h3><table id="afree"><thead><tr><th>开始</th><th>结束</th></tr></thead><tbody></tbody></table>
+</section>
+
+<section><h2>排期 / 改版 / 撤档 / 实播回执 / 对账</h2>
+<div class="grid">
+<input id="airdate" value="2026-09-28"><input id="starttime" value="12:00"><input id="pid" type="number" placeholder="节目版本 ID">
+<input id="sid" type="number" placeholder="排期 ID"><input id="newpid" type="number" placeholder="替换版本 ID"><input id="actualstart" value="12:00">
+<input id="actualduration" type="number" value="5" placeholder="实播分钟"><input id="actualpid" type="number" placeholder="实播节目 ID，可空"><input id="receipt" placeholder="回执号（幂等）">
+</div>
+<button onclick="schedule()">排期</button><button onclick="replace()">改版换版本</button><button class="danger" onclick="cancel()">撤档</button>
+<button onclick="playout()">登记实播回执</button><button onclick="reconcile()">对账</button>
+<pre id="result"></pre></section>
+
 <section><h2>新建节目</h2><div class="grid">
 <input id="title" placeholder="节目名"><select id="kind"><option>music</option><option>ad</option><option>talk</option><option>live</option></select>
 <input id="duration" type="number" value="30" placeholder="分钟"><input id="start" value="2026-01-01"><input id="end" value="2026-12-31">
-<input id="region" value="华东"><input id="sponsor" placeholder="赞助商，可空"><input id="cooldown" type="number" value="0" placeholder="冷却分钟">
+<input id="region" value="华东"><input id="sponsor" placeholder="广告主/赞助商，可空"><input id="cooldown" type="number" value="0" placeholder="冷却分钟">
 </div><button onclick="addProgram()">创建并授权地区</button></section>
-<section><h2>排期 / 替换 / 实播对账</h2>
-<div class="grid"><input id="airdate" value="2026-09-28"><input id="starttime" value="12:00"><input id="pid" type="number" placeholder="节目 ID">
-<input id="sid" type="number" placeholder="排期 ID"><input id="newpid" type="number" placeholder="替换节目 ID"><input id="actualstart" value="12:00">
-<input id="actualduration" type="number" value="30" placeholder="实播分钟"><input id="actualpid" type="number" placeholder="实播节目 ID，可空"></div>
-<button onclick="schedule()">排期</button><button onclick="replace()">替换</button><button onclick="playout()">记录实播</button><button onclick="reconcile()">对账</button><pre id="result"></pre></section>
+
 <script>
 const api=async(url,body)=>{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();out(j);return j};
 const out=x=>document.querySelector('#result').textContent=JSON.stringify(x,null,2);
+const num=id=>+document.querySelector('#'+id).value;
+const val=id=>document.querySelector('#'+id).value;
+
 async function load(){document.querySelector('#state').textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}
-function addProgram(){api('/api/programs',{title:title.value,kind:kind.value,duration_minutes:+duration.value,start_date:start.value,end_date:end.value,region:region.value,regions:[region.value],sponsor:sponsor.value||null,cooldown_minutes:+cooldown.value})}
-function schedule(){api('/api/schedule',{air_date:airdate.value,start_time:starttime.value,program_id:+pid.value,region:region.value})}
-function replace(){api('/api/slots/'+sid.value+'/replace',{new_program_id:+newpid.value})}
-function playout(){api('/api/playout',{slot_id:+sid.value,actual_start:actualstart.value,actual_duration_minutes:+actualduration.value,actual_program_id:actualpid.value?+actualpid.value:null})}
-function reconcile(){api('/api/reconcile',{date:airdate.value})}
-load();
+
+async function loadContracts(){
+  const q=new URLSearchParams();if(val('fregion'))q.set('region',val('fregion'));if(val('fdate'))q.set('date',val('fdate'));
+  const data=await (await fetch('/api/contracts?'+q)).json();
+  const tb=document.querySelector('#ctable tbody');tb.innerHTML='';
+  for(const c of data.contracts){
+    const pct=c.total_count?Math.round((c.total_count-c.remaining)/c.total_count*100):0;
+    const cls=c.remaining<=0?'bad':'ok';
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${c.id}</td><td>${c.advertiser}</td><td>${c.region}</td><td>${c.air_date}</td><td>#${c.program_id}</td>
+      <td>${c.total_count}</td><td>${c.occupied}</td><td>${c.written_off}</td>
+      <td class="${cls}">${c.remaining}</td>
+      <td><span class="bar"><i style="width:${pct}%"></i></span></td>
+      <td><button class="alt" onclick="recover(${c.id})">凭合同号恢复</button></td>`;
+    tb.appendChild(tr);
+  }
+}
+
+async function loadAvailability(){
+  const q=new URLSearchParams({date:val('adate'),region:val('aregion')});
+  const data=await (await fetch('/api/availability?'+q)).json();
+  const tl=document.querySelector('#atimeline');tl.innerHTML='';
+  const dayStart=360,dayEnd=1440; // 06:00-24:00
+  const pct=m=>(m-dayStart)/(dayEnd-dayStart)*100;
+  for(const o of data.occupied){
+    const s=min(o.start_time),e=min(o.end_time);
+    const d=document.createElement('div');d.className='occ';
+    d.style.left=pct(s)+'%';d.style.width=Math.max(pct(e)-pct(s),0.4)+'%';
+    d.title=`#${o.id} ${o.title} ${o.start_time}-${o.end_time} (${o.status})`;
+    d.textContent=`#${o.id} ${o.title}`;
+    tl.appendChild(d);
+  }
+  for(const f of data.free){
+    const s=min(f.start_time),e=min(f.end_time);
+    const d=document.createElement('div');d.className='free';
+    d.style.left=pct(s)+'%';d.style.width=Math.max(pct(e)-pct(s),0.4)+'%';
+    d.title=`剩余 ${f.start_time}-${f.end_time}`;
+    tl.appendChild(d);
+  }
+  const ot=document.querySelector('#aocc tbody');ot.innerHTML='';
+  for(const o of data.occupied){ot.innerHTML+=`<tr><td>#${o.id}</td><td>${o.title}</td><td>${o.start_time}</td><td>${o.end_time}</td><td>${o.status}</td></tr>`}
+  const ft=document.querySelector('#afree tbody');ft.innerHTML='';
+  for(const f of data.free){ft.innerHTML+=`<tr><td>${f.start_time}</td><td>${f.end_time}</td></tr>`}
+}
+function min(t){const [h,m]=t.split(':').map(Number);return h*60+m}
+
+async function addContract(){await api('/api/contracts',{advertiser:val('cadv'),region:val('cregion'),air_date:val('cdate'),program_id:num('cpid'),total_count:num('ccount'),note:val('cnote')||null});loadContracts()}
+async function recover(id){await api('/api/contracts/'+id+'/recover',{});loadContracts()}
+async function schedule(){const r=await api('/api/schedule',{air_date:val('airdate'),start_time:val('starttime'),program_id:num('pid'),region:val('region')});if(r.ok){loadContracts();loadAvailability()}}
+async function replace(){await api('/api/slots/'+num('sid')+'/replace',{new_program_id:num('newpid')});loadContracts()}
+async function cancel(){await api('/api/slots/'+num('sid')+'/cancel',{});loadContracts()}
+async function playout(){await api('/api/playout',{slot_id:num('sid'),actual_start:val('actualstart'),actual_duration_minutes:num('actualduration'),actual_program_id:num('actualpid')||null,receipt_no:val('receipt')||null});loadContracts()}
+async function reconcile(){await api('/api/reconcile',{date:val('airdate')})}
+function addProgram(){api('/api/programs',{title:val('title'),kind:val('kind'),duration_minutes:num('duration'),start_date:val('start'),end_date:val('end'),region:val('region'),regions:[val('region')],sponsor:val('sponsor')||null,cooldown_minutes:num('cooldown')})}
+
+load();loadContracts();loadAvailability();
 </script>
 </html>
